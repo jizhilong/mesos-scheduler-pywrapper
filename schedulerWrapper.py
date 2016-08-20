@@ -1,5 +1,6 @@
-import time
+import errno
 import threading
+import socket
 import Queue
 import logging
 
@@ -7,10 +8,80 @@ from mesos.interface import Scheduler as _Scheduler
 from mesos.native import MesosSchedulerDriver as _MesosSchedulerDriver
 from mesos.native import MesosSchedulerDriverImpl as _MesosSchedulerDriverImpl
 
+has_gevent = True
+try:
+    import gevent
+    pysocket = gevent.monkey.get_original('socket', 'socket')
+except ImportError:
+    has_gevent = False
+    pysocket = socket.socket
+
+
+def socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+    """Emulate the Unix socketpair() function on Windows."""
+    # We create a connected TCP socket. Note the trick with setblocking(0)
+    # that prevents us from having to create a thread.
+    lsock = pysocket(family, type, proto)
+    lsock.bind(('localhost', 0))
+    lsock.listen(1)
+    addr, port = lsock.getsockname()
+    csock = pysocket(family, type, proto)
+    csock.setblocking(0)
+    try:
+        csock.connect((addr, port))
+    except socket.error, e:
+        if e.errno != errno.EINPROGRESS:
+            raise
+    ssock, addr = lsock.accept()
+    csock.setblocking(1)
+    lsock.close()
+    return (ssock, csock)
+
+
+class HyberQueue(Queue.Queue):
+    def __init__(self, *args, **kwargs):
+        Queue.Queue.__init__(self, *args, **kwargs)
+        self.wsock, self.rsock = socketpair()
+
+    def reinit(self, greenw=False, greenr=False):
+        if not has_gevent:
+            return
+        if greenw:
+            self.wsock = gevent.socket.socket(_sock=self.wsock)
+        else:
+            if not isinstance(self.wsock, pysocket):
+                self.wsock = self.wsock._sock
+                self.wsock.setblocking(1)
+
+        if greenr:
+            self.rsock = gevent.socket.socket(_sock=self.rsock)
+        else:
+            if not isinstance(self.wsock, pysocket):
+                self.wsock = self.wsock._sock
+                self.wsock.setblocking(1)
+
+    def get(self, *args, **kwargs):
+        self.rsock.recv(1)
+        return Queue.Queue.get(self, *args, **kwargs)
+
+    def get_all_available(self):
+        self.rsock.recv(1)
+        ret = []
+        self.mutex.acquire()
+        while self._qsize():
+            ret.append(self._get())
+        self.mutex.release()
+        return ret
+
+    def put(self, *args, **kwargs):
+        ret = Queue.Queue.put(self, *args, **kwargs)
+        self.wsock.send('1')
+        return ret
+
 # messages got from mesos master
-from_mesos_queue = Queue.Queue(10000)
+from_mesos_queue = HyberQueue(10000)
 # messages will be sent to mesos master
-to_mesos_queue = Queue.Queue(10000)
+to_mesos_queue = HyberQueue(10000)
 
 
 def redirect_to_queue(queue):
@@ -107,18 +178,16 @@ class Scheduler(_Scheduler):
         self.running = True
 
     def start(self):
+        from_mesos_queue.reinit(greenr=True)
+        to_mesos_queue.reinit(greenw=True)
         while self.running:
-            try:
-                func_name, args, kwargs = from_mesos_queue.get(timeout=0.02)
-            except Queue.Empty:
-                continue
-            func = getattr(self, func_name)
-            func(*args, **kwargs)
+            msgs = from_mesos_queue.get_all_available()
+            for func_name, args, kwargs in msgs:
+                func = getattr(self, func_name)
+                func(*args, **kwargs)
 
     def stop(self):
         self.running = False
-
-
 
 class MesosSchedulerDriver(object):
     def __init__(self, scheduler, framework, master,
