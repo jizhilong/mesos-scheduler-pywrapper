@@ -12,30 +12,11 @@ has_gevent = True
 try:
     import gevent
     pysocket = gevent.monkey.get_original('socket', 'socket')
+    socketpair = gevent.monkey.get_original('socket', 'socketpair')
 except ImportError:
     has_gevent = False
     pysocket = socket.socket
-
-
-def socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
-    """Emulate the Unix socketpair() function on Windows."""
-    # We create a connected TCP socket. Note the trick with setblocking(0)
-    # that prevents us from having to create a thread.
-    lsock = pysocket(family, type, proto)
-    lsock.bind(('localhost', 0))
-    lsock.listen(1)
-    addr, port = lsock.getsockname()
-    csock = pysocket(family, type, proto)
-    csock.setblocking(0)
-    try:
-        csock.connect((addr, port))
-    except socket.error, e:
-        if e.errno != errno.EINPROGRESS:
-            raise
-    ssock, addr = lsock.accept()
-    csock.setblocking(1)
-    lsock.close()
-    return (ssock, csock)
+    socketpair = socket.socketpair
 
 
 class HyberQueue(Queue.Queue):
@@ -49,7 +30,8 @@ class HyberQueue(Queue.Queue):
         if greenw:
             self.wsock = gevent.socket.socket(_sock=self.wsock)
         else:
-            if not isinstance(self.wsock, pysocket):
+            if isinstance(self.wsock, gevent.socket.socket):
+                print self.wsock.__class__
                 self.wsock = self.wsock._sock
                 self.wsock.setblocking(1)
 
