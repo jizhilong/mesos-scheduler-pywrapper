@@ -190,6 +190,7 @@ class MesosSchedulerDriver(object):
             thread.start()
 
     def stop(self):
+        self.driver.stop()
         self.running = False
 
     def join(self):
